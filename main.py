@@ -29,7 +29,13 @@ TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 
 # 每次 AKShare 请求之间稍微等待一下
-REQUEST_SLEEP = 0.5
+REQUEST_SLEEP = 0.8
+
+# AKShare 网络请求失败时的重试次数
+API_RETRY_TIMES = 3
+
+# 每次重试之间等待秒数
+API_RETRY_SLEEP = 3
 
 # Telegram 请求超时
 TELEGRAM_TIMEOUT = 20
@@ -234,77 +240,42 @@ def is_main_board(code: str) -> bool:
 # 获取股票基本信息
 # ============================================================
 
-def get_stock_basic_info():
+def get_stock_basic_info_from_history(history):
     """
-    一次获取沪深京 A 股实时列表。
+    从跌停池历史数据中取得股票代码和名称。
 
-    不需要对每只股票逐一调用
-    stock_individual_info_em()。
-
-    返回：
-
-        code
-        name
+    不再调用 stock_zh_a_spot_em()。
+    这样可以避免 GitHub Actions 中访问东方财富实时行情
+    接口时出现 RemoteDisconnected。
     """
+    rows = []
 
-    logger.info(
-        "获取沪深京 A 股股票列表"
-    )
+    for item in history.values():
+        if item is None or item.empty:
+            continue
 
-    df = ak.stock_zh_a_spot_em()
+        rows.append(item[["code", "name"]].copy())
 
-    if df is None or df.empty:
-        raise RuntimeError(
-            "stock_zh_a_spot_em() 返回为空"
-        )
+    if not rows:
+        return pd.DataFrame(columns=["code", "name"])
 
-    if "代码" not in df.columns:
-        raise RuntimeError(
-            "股票列表中没有“代码”字段："
-            f"{df.columns.tolist()}"
-        )
+    result = pd.concat(rows, ignore_index=True)
 
-    if "名称" not in df.columns:
-        raise RuntimeError(
-            "股票列表中没有“名称”字段："
-            f"{df.columns.tolist()}"
-        )
-
-    result = df[
-        ["代码", "名称"]
-    ].copy()
-
-    result.columns = [
-        "code",
-        "name",
-    ]
-
-    result["code"] = (
-        result["code"]
-        .astype(str)
-        .str.extract(r"(\d{6})")[0]
-    )
-
-    result["name"] = (
-        result["name"]
-        .astype(str)
-        .str.strip()
-    )
+    result["code"] = result["code"].astype(str).str.strip()
+    result["name"] = result["name"].astype(str).str.strip()
 
     # 只保留沪深主板
     result = result[
-        result["code"].apply(
-            is_main_board
-        )
+        result["code"].apply(is_main_board)
     ].copy()
 
+    # 同一股票可能在多个交易日出现，只保留一条
     result = result.drop_duplicates(
-        subset=["code"]
+        subset=["code"],
+        keep="last",
     )
 
-    return result.reset_index(
-        drop=True
-    )
+    return result.reset_index(drop=True)
 
 
 # ============================================================
@@ -317,48 +288,31 @@ def get_limit_down_pool(
     """
     获取某个交易日的跌停池。
 
-    兼容两个接口名称：
-
-    老/用户当前环境：
+    兼容：
         stock_zt_pool_dtgc
-
-    新版 AKShare：
         stock_zt_pool_dtgc_em
 
-    返回 DataFrame。
+    网络异常会自动重试，避免一次 RemoteDisconnected
+    直接导致 GitHub Actions 失败。
     """
 
     funcs = []
-    '''
-        # 用户当前使用的接口优先
-    if hasattr(
-        ak,
-        "stock_zt_pool_dtgc",
-    ):
+
+    # 用户原环境中的接口优先
+    if hasattr(ak, "stock_zt_pool_dtgc"):
         funcs.append(
             (
                 "stock_zt_pool_dtgc",
-                getattr(
-                    ak,
-                    "stock_zt_pool_dtgc",
-                ),
+                getattr(ak, "stock_zt_pool_dtgc"),
             )
         )
-    '''
 
-
-    # 当前 AKShare 文档接口
-    if hasattr(
-        ak,
-        "stock_zt_pool_dtgc_em",
-    ):
+    # 新版 AKShare 接口
+    if hasattr(ak, "stock_zt_pool_dtgc_em"):
         funcs.append(
             (
                 "stock_zt_pool_dtgc_em",
-                getattr(
-                    ak,
-                    "stock_zt_pool_dtgc_em",
-                ),
+                getattr(ak, "stock_zt_pool_dtgc_em"),
             )
         )
 
@@ -372,41 +326,43 @@ def get_limit_down_pool(
     last_error = None
 
     for name, func in funcs:
+        for attempt in range(1, API_RETRY_TIMES + 1):
+            try:
+                logger.info(
+                    "调用 %s，日期=%s，第 %d/%d 次",
+                    name,
+                    trade_date,
+                    attempt,
+                    API_RETRY_TIMES,
+                )
 
-        try:
+                df = func(date=trade_date)
 
-            logger.info(
-                "调用 %s，日期=%s",
-                name,
-                trade_date,
-            )
+                if df is None:
+                    return pd.DataFrame()
 
-            df = func(
-                date=trade_date
-            )
+                return df
 
-            if df is None:
-                return pd.DataFrame()
+            except Exception as e:
+                last_error = e
 
-            return df
+                logger.warning(
+                    "%s 调用失败（日期=%s，第 %d/%d 次）：%s",
+                    name,
+                    trade_date,
+                    attempt,
+                    API_RETRY_TIMES,
+                    e,
+                )
 
-        except Exception as e:
+                if attempt < API_RETRY_TIMES:
+                    time.sleep(API_RETRY_SLEEP)
 
-            last_error = e
-
-            logger.warning(
-                "%s 调用失败：%s",
-                name,
-                e,
-            )
-
-            time.sleep(
-                REQUEST_SLEEP
-            )
+        # 当前接口连续失败后，再尝试另一个兼容接口
+        time.sleep(REQUEST_SLEEP)
 
     raise RuntimeError(
-        f"所有跌停池接口均调用失败："
-        f"{last_error}"
+        f"所有跌停池接口均调用失败：{last_error}"
     )
 
 
@@ -510,22 +466,17 @@ def collect_limit_down_history(
     trade_dates,
 ):
     """
-    一次性抓取最近 N 个交易日的跌停池。
+    抓取最近 N 个交易日的跌停池。
 
-    这是整个程序的核心优化。
+    返回：
+        history: {交易日: 股票代码集合}
+        stock_info: 最近 N 个交易日跌停池中出现过的
+                    股票代码和名称
 
-    不对股票逐一请求。
-
-    假设：
-        20 个交易日
-
-    那么最多：
-        20 次跌停池 API 请求
-
-    后续所有计算全部在本地完成。
+    不再请求全市场实时股票列表。
     """
-
     history = {}
+    stock_info_parts = []
 
     total = len(trade_dates)
 
@@ -533,7 +484,6 @@ def collect_limit_down_history(
         trade_dates,
         start=1,
     ):
-
         logger.info(
             "[%d/%d] 获取跌停池：%s",
             index,
@@ -541,16 +491,15 @@ def collect_limit_down_history(
             trade_date,
         )
 
-        raw = get_limit_down_pool(
-            trade_date
-        )
+        raw = get_limit_down_pool(trade_date)
 
-        normalized = (
-            normalize_limit_down_pool(raw)
-        )
+        normalized = normalize_limit_down_pool(raw)
 
-        # 只保存股票代码集合。
-        # 名称最后从实时股票列表获得。
+        if not normalized.empty:
+            stock_info_parts.append(
+                normalized[["code", "name"]].copy()
+            )
+
         codes = set(
             normalized["code"].tolist()
         )
@@ -563,11 +512,26 @@ def collect_limit_down_history(
             len(codes),
         )
 
-        time.sleep(
-            REQUEST_SLEEP
+        time.sleep(REQUEST_SLEEP)
+
+    if stock_info_parts:
+        stock_info = pd.concat(
+            stock_info_parts,
+            ignore_index=True,
+        )
+        stock_info = stock_info.drop_duplicates(
+            subset=["code"],
+            keep="last",
+        ).reset_index(drop=True)
+        stock_info = stock_info[
+            stock_info["code"].apply(is_main_board)
+        ].copy()
+    else:
+        stock_info = pd.DataFrame(
+            columns=["code", "name"]
         )
 
-    return history
+    return history, stock_info
 
 
 # ============================================================
@@ -1019,31 +983,25 @@ def main():
     calendar = get_trade_calendar()
 
     # --------------------------------------------------------
-    # 4. 获取股票基本信息
+    # 4. 获取最近20个交易日跌停池
     #
-    # 一次调用，而不是每只股票调用
+    # 核心：
+    # 不再调用 stock_zh_a_spot_em() 获取全市场实时行情。
+    # 直接从跌停池取得代码和名称。
     # --------------------------------------------------------
 
-    stock_info = get_stock_basic_info()
+    history, stock_info = collect_limit_down_history(
+        trade_dates
+    )
 
     logger.info(
-        "沪深主板股票数量：%d",
+        "最近 %d 个交易日跌停池中出现的沪深主板股票：%d",
+        len(trade_dates),
         len(stock_info),
     )
 
     # --------------------------------------------------------
-    # 5. 获取最近20个交易日跌停池
-    #
-    # 核心：
-    # 只调用 N 次 API
-    # --------------------------------------------------------
-
-    history = collect_limit_down_history(
-        trade_dates
-    )
-
-    # --------------------------------------------------------
-    # 6. 本地计算连续跌停
+    # 5. 本地计算连续跌停
     # --------------------------------------------------------
 
     consecutive = calculate_consecutive_days(
