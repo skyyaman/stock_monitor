@@ -19,7 +19,7 @@ MIN_CONSECUTIVE_DT = 3
 # 最多向前检查多少个交易日
 # 例如 20 表示最多识别：
 # 3连跌、4连跌、5连跌……20连跌
-LOOKBACK_TRADE_DAYS = 20
+LOOKBACK_TRADE_DAYS = 10
 
 # 上市不足多少个交易日的新股排除
 MIN_LISTING_TRADE_DAYS = 60
