@@ -329,8 +329,8 @@ def get_limit_down_pool(
     """
 
     funcs = []
-
-    # 用户当前使用的接口优先
+    '''
+        # 用户当前使用的接口优先
     if hasattr(
         ak,
         "stock_zt_pool_dtgc",
@@ -344,6 +344,8 @@ def get_limit_down_pool(
                 ),
             )
         )
+    '''
+
 
     # 当前 AKShare 文档接口
     if hasattr(
